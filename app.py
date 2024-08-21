@@ -5,21 +5,20 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 import os
 from utils.calculate_result import calculate_result 
+from datetime import datetime
 
-# Load environment variables
 load_dotenv()
 
-# Initialize the Flask application
 app = Flask(__name__)
 
-# MongoDB setup
+
 client = MongoClient(os.getenv('MONGO_URI'))
 db = client.quiz_db
 
 # Route: Home
 @app.route('/')
 def index():
-    return "Welcome to the Quiz Application API!"
+    return "Welcome to the Quiz Application!"
 
 # Route: Signup
 @app.route('/signup', methods=['POST'])
@@ -67,7 +66,7 @@ def submit_test():
         "user_id": ObjectId(data['user_id']),
         "test_id": ObjectId(data['test_id']),
         "answers": data['answers'],
-        "submitted_at": data.get('submitted_at', '2024-08-17T10:00:00Z')  # Use current timestamp or provided one
+        "submitted_at": datetime.utcnow()
     }
     db.submissions.insert_one(submission_data)
     return jsonify(message="Test submitted successfully"), 201
@@ -75,16 +74,16 @@ def submit_test():
 # Route: Get Test Result
 @app.route('/tests/result/<submission_id>', methods=['GET'])
 def get_result(submission_id):
-    # Fetch the submission document from MongoDB
+   
     submission = db.submissions.find_one({'_id': ObjectId(submission_id)})
     
     if submission:
-        # Fetch the associated test document
+        
         test = db.tests.find_one({'_id': ObjectId(submission['test_id'])})
         if not test:
             return jsonify(message="Test data not found"), 404
 
-        # Calculate result using the separate function
+        
         result = calculate_result(test, submission)
         return jsonify(result)
     

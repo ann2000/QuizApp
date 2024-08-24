@@ -1,0 +1,41 @@
+Table: users
+{
+    username : String
+    email : String
+    password : String
+}
+
+Table: tests
+{
+    title : String
+    subjects : Array(3)
+    [
+        subject_name : String
+        questions : Array(5)
+        [
+            question_id : String
+            question_text : String
+            options : Array(4)
+            [
+                String
+            ]
+            correct_answer : String
+        ]
+    ]
+}
+
+Table: submissions
+{
+    user_id : ObjectId
+    test_id : ObjectId
+    answers : Array(3)
+    [
+        subject_name : String
+        answers : Array(5)
+        [
+            question_id : String
+            selected_answer : String
+        ]
+    ]
+    submitted_at: String
+}

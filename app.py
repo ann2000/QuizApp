@@ -1,39 +1,80 @@
 from flask import Flask, request, jsonify
+from functools import wraps 
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from utils.calculate_result import calculate_result
 import os
-from utils.calculate_result import calculate_result 
-from datetime import datetime
-import os
-import secrets
-from functools import wraps
-
-def generate_session_token():
-    return secrets.token_hex(32)
-
-def require_login(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        session_token = request.cookies.get('session_token')
-        if not session_token:
-            return jsonify(message="Unauthorized"), 401
-        session = db.sessions.find_one({'session_token': session_token})
-        if not session or session['expires_at'] < datetime.utcnow():
-            return jsonify(message="Session expired or invalid"), 401
-        request.user_id = session['user_id']
-        return f(*args, **kwargs)
-    return decorated_function
-
+import jwt
 
 load_dotenv()
 
 app = Flask(__name__)
-
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 15
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = 7 
 
 client = MongoClient(os.getenv('MONGO_URI'))
 db = client.quiz_db
+
+def create_access_token(user_id):
+    return jwt.encode({
+        'user_id': user_id,
+        'exp': datetime.utcnow() + timedelta(minutes=app.config['JWT_ACCESS_TOKEN_EXPIRES'])
+    }, app.config['JWT_SECRET_KEY'], algorithm='HS256')
+
+def create_refresh_token(user_id):
+    return jwt.encode({
+        'user_id': user_id,
+        'exp': datetime.utcnow() + timedelta(days=app.config['JWT_REFRESH_TOKEN_EXPIRES'])
+    }, app.config['JWT_SECRET_KEY'], algorithm='HS256')
+
+def decode_token(token):
+    try:
+        return jwt.decode(token, app.config['JWT_SECRET_KEY'], algorithms=['HS256'])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+def token_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 403
+        token = token.split(" ")[1]
+        decoded_token = decode_token(token)
+        if not decoded_token:
+            return jsonify({'message': 'Token is invalid or expired!'}), 403
+        request.user_id = decoded_token['user_id']
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    user = db.users.find_one({'email': data['email']})
+    if user and check_password_hash(user['password'], data['password']):
+        access_token = create_access_token(str(user['_id']))
+        refresh_token = create_refresh_token(str(user['_id']))
+        return jsonify({
+            'access_token': access_token,
+            'refresh_token': refresh_token
+        }), 200
+    return jsonify({'message': 'Invalid credentials'}), 401
+
+@app.route('/refresh', methods=['POST'])
+def refresh_token():
+    refresh_token = request.json.get('refresh_token')
+    decoded_token = decode_token(refresh_token)
+    if not decoded_token:
+        return jsonify({'message': 'Refresh token is invalid or expired!'}), 403
+    
+    new_access_token = create_access_token(decoded_token['user_id'])
+    return jsonify({'access_token': new_access_token}), 200
 
 # Route: Home
 @app.route('/')
@@ -52,53 +93,33 @@ def signup():
     })
     return jsonify(message="User registered successfully"), 201
 
-# Route: Login
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    user = db.users.find_one({'email': data['email']})
-    if user and check_password_hash(user['password'], data['password']):
-        session_token = generate_session_token()
-        db.sessions.insert_one({
-            'user_id': str(user['_id']),
-            'session_token': session_token,
-            'expires_at': datetime.utcnow() + timedelta(hours=1)
-        })
-        response = jsonify(message="Login successful")
-        response.set_cookie('session_token', session_token, httponly=True, secure=True)
-        return response, 200
-    return jsonify(message="Invalid credentials"), 401
-
-
-# Route: Get Test List with Pagination
+#Route: Get Test List
 @app.route('/tests', methods=['GET'])
 def get_tests():
-
-    page = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', 10))
-
-    skips = per_page * (page - 1)
-
-    tests_cursor = db.tests.find().skip(skips).limit(per_page)
+    last_id = request.args.get('last_id')
+    
+    query = {}
+    if last_id:
+        query['_id'] = {'$gt': ObjectId(last_id)}
+    
+    tests_cursor = db.tests.find(query).sort('_id', 1).limit(per_page)
     tests = list(tests_cursor)
-
+    
     for test in tests:
         test['_id'] = str(test['_id'])
-
-    total_tests = db.tests.count_documents({})
-
+    
+    next_id = tests[-1]['_id'] if tests else None
+    
     response = {
         'tests': tests,
-        'page': page,
         'per_page': per_page,
-        'total_tests': total_tests,
-        'total_pages': (total_tests + per_page - 1) // per_page
+        'next_id': next_id
     }
     
     return jsonify(response)
 
-
-# Route: Get Test Specifics
+#Route: Get Test Specifics
 @app.route('/tests/<test_id>', methods=['GET'])
 def get_test(test_id):
     test = db.tests.find_one({'_id': ObjectId(test_id)})
@@ -109,8 +130,9 @@ def get_test(test_id):
 
 # Route: Submit Test
 @app.route('/tests/submit', methods=['POST'])
-@require_login
+@token_required
 def submit_test():
+
     data = request.get_json()
     submission_data = {
         "user_id": ObjectId(data['user_id']),
@@ -123,31 +145,25 @@ def submit_test():
 
 # Route: Get Test Result
 @app.route('/tests/result/<submission_id>', methods=['GET'])
-@require_login
+@token_required
 def get_result(submission_id):
-   
     submission = db.submissions.find_one({'_id': ObjectId(submission_id)})
     
     if submission:
-        
         test = db.tests.find_one({'_id': ObjectId(submission['test_id'])})
         if not test:
             return jsonify(message="Test data not found"), 404
 
-        
         result = calculate_result(test, submission)
         return jsonify(result)
     
     return jsonify(message="Submission not found"), 404
 
 @app.route('/logout', methods=['POST'])
-@require_login
+@token_required
 def logout():
-    session_token = request.cookies.get('session_token')
-    db.sessions.delete_one({'session_token': session_token})
-    response = jsonify(message="Logged out successfully")
-    response.delete_cookie('session_token') 
-    return response, 200
+    refresh_token = request.json.get('refresh_token')
+    return jsonify({'message': 'Logged out successfully'}), 200
 
 if __name__ == '__main__':
     app.run(debug=True)
